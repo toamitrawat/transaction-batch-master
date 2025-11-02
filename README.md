@@ -6,7 +6,8 @@ A Spring Batch application that processes large transaction files from AWS S3 us
 
 This master application is part of a distributed transaction processing system that:
 - Listens for S3 file upload events via AWS SQS
-- Partitions large files into byte ranges (50MB chunks)
+- Partitions large files into byte ranges (~50MB chunks aligned to record boundaries)
+- **Ensures data integrity** by keeping CSV records intact across partitions
 - Publishes partition metadata to Kafka for worker nodes to process
 - Coordinates distributed batch processing using Spring Batch
 - Supports idempotent operations and robust error handling
@@ -27,10 +28,24 @@ S3 Upload → SQS Event → Master Application → Byte Range Partitioner → Ka
 
 1. **S3EventListener**: Receives S3 ObjectCreated events from SQS (supports SNS wrapper)
 2. **FileProcessingService**: Launches Spring Batch jobs asynchronously
-3. **ByteRangePartitioner**: Divides large files into 50MB byte ranges
+3. **ByteRangePartitioner**: Divides large files into ~50MB byte ranges with record boundary alignment
 4. **BatchConfig**: Tasklet-based job execution for partition creation
 5. **Kafka Producer**: Sends partition metadata to worker nodes with idempotence
 6. **Spring Batch**: Orchestrates the partitioning workflow with Oracle transaction support
+
+## Key Features
+
+### Data Integrity
+- **Record Boundary Detection**: Automatically adjusts partition boundaries to align with newline characters
+- **Complete Record Guarantee**: No CSV records are split across partitions
+- **S3 Range Requests**: Uses 1MB buffer to find nearest line ending after each 50MB boundary
+- **Transparent Adjustment**: Logs boundary adjustments for monitoring and debugging
+
+### Scalability
+- Processes files of any size (tested with 100MB+ files)
+- Configurable partition size (default 50MB)
+- Asynchronous Kafka publishing with callback confirmation
+- Parallel processing via distributed worker nodes
 
 ## Technology Stack
 
@@ -252,6 +267,9 @@ Core partitioning logic that divides large S3 files into manageable byte ranges 
 **Key Features:**
 - Queries S3 for file metadata using HeadObject API
 - Creates 50MB partitions (configurable via `PARTITION_SIZE` constant)
+- **Ensures complete records** - Adjusts partition boundaries to nearest newline character
+- Uses S3 range requests to find line endings (1MB buffer for detection)
+- Prevents CSV records from being split across partitions
 - Generates partition metadata with byte ranges
 - Publishes PartitionData to Kafka asynchronously
 - Callback-based Kafka send confirmation with logging
@@ -260,6 +278,16 @@ Core partitioning logic that divides large S3 files into manageable byte ranges 
 - Thread-safe partition numbering
 
 **Partition Size:** 50MB (50 * 1024 * 1024 bytes)
+
+**Record Boundary Detection:**
+To ensure data integrity, the partitioner doesn't split records at exact 50MB boundaries. Instead, it:
+1. Calculates the proposed boundary (50MB from start)
+2. Reads a 1MB buffer from S3 starting at that position
+3. Searches byte-by-byte for the next newline (`\n`) character
+4. Adjusts the `endByte` to align with the complete record
+5. Logs the adjustment for monitoring purposes
+
+This guarantees that workers receive only complete, valid CSV records for processing.
 
 **Example Output:**
 ```
@@ -386,12 +414,14 @@ aws s3api put-bucket-notification-configuration \
 ### 4. IAM Permissions
 
 Ensure your AWS credentials have the following permissions:
-- `s3:GetObject` - Read file content
+- `s3:GetObject` - Read file content and byte ranges (for record boundary detection)
 - `s3:HeadObject` - Get file metadata (size, etc.)
 - `sqs:ReceiveMessage` - Poll SQS queue
 - `sqs:DeleteMessage` - Remove processed messages
 - `sqs:GetQueueAttributes` - Queue configuration
 - `sqs:ChangeMessageVisibility` - Handle retries
+
+**Note:** The `s3:GetObject` permission is required for both worker nodes (to read partition data) and the master application (to find record boundaries using byte-range requests).
 
 **SQS Policy**: Add permission for S3 to send messages:
 ```json
@@ -642,11 +672,21 @@ For a 106MB file (`transactions.txt`):
 - Partition size: 50MB (52,428,800 bytes)
 - Total partitions: 3
 
-| Partition | Start Byte | End Byte | Size |
-|-----------|-----------|----------|------|
-| 0 | 0 | 52,428,799 | 50MB |
-| 1 | 52,428,800 | 104,857,599 | 50MB |
-| 2 | 104,857,600 | 106,428,388 | 1.5MB |
+**Note:** Actual partition boundaries are adjusted to align with complete records (newline characters), so the exact byte positions may vary slightly from the calculated 50MB boundaries.
+
+| Partition | Start Byte | End Byte | Size | Notes |
+|-----------|-----------|----------|------|-------|
+| 0 | 0 | 52,428,799* | ~50MB | *Adjusted to nearest newline |
+| 1 | 52,428,800 | 104,857,599* | ~50MB | *Adjusted to nearest newline |
+| 2 | 104,857,600 | 106,428,388 | ~1.5MB | Last partition to end of file |
+
+**Example Log Output:**
+```
+INFO - File size: 106428389 bytes for s3://amit-transaction-files/transactions.txt
+DEBUG - Partition 0: proposed end=52428799, adjusted end=52428856 (adjusted by 57 bytes)
+DEBUG - Adjusted partition boundary to align with record ending at byte 52428856
+INFO - Created 3 partitions for file: transactions.txt
+```
 
 **Kafka Message Example:**
 ```json
@@ -834,20 +874,21 @@ private static final long PARTITION_SIZE = 100 * 1024 * 1024;
 - Larger partitions = Fewer messages, less overhead, longer worker processing time
 - Network bandwidth between workers and S3
 - Worker memory capacity
+- **Important:** Actual partition sizes will vary slightly due to record boundary alignment
+
+### Record Boundary Buffer Size
+
+The partitioner uses a 1MB buffer to find line endings:
 
 ```java
-private static final long PARTITION_SIZE = 50 * 1024 * 1024; // 50 MB
+private static final int BUFFER_SIZE = 1024 * 1024; // 1 MB buffer to find line ending
 ```
 
-Considerations:
-- **Smaller partitions**: More parallelism, more overhead
-- **Larger partitions**: Less parallelism, more memory per worker
-
-### Grid Size
-
-Adjust grid size in BatchConfig:
-
-```java
+**Tuning Considerations:**
+- **Larger buffer**: Can handle longer records, uses more memory per partition check
+- **Smaller buffer**: More memory efficient, may fail if records exceed buffer size
+- Current 1MB buffer accommodates most CSV record sizes
+- If you have extremely long records (>1MB per line), increase this value
 ### HikariCP Connection Pool
 
 Current configuration optimized for Oracle:
@@ -1047,6 +1088,29 @@ docker exec <kafka> kafka-console-consumer \
 - Check network connectivity to Kafka cluster
 - Review Kafka broker logs
 
+#### 7. Record Boundary Adjustment Warnings
+
+**Symptoms**:
+```
+DEBUG - Adjusted partition boundary to align with record ending at byte 52428856
+WARN - Could not find newline within 1MB buffer, using buffer end
+```
+
+**Explanation**: Normal operation - partitioner is aligning boundaries with complete records
+
+**When to investigate**:
+- **Frequent "Could not find newline" warnings**: May indicate records longer than 1MB buffer
+  - **Solution**: Increase `BUFFER_SIZE` in `ByteRangePartitioner.java`
+- **Large boundary adjustments** (>10KB): Could indicate unusual record structure
+  - **Check**: Verify CSV format, look for embedded newlines in quoted fields
+- **S3 GetObject errors**: Network issues reading byte ranges
+  - **Check**: AWS credentials, S3 bucket permissions, network connectivity
+
+**Normal behavior**:
+- Small adjustments (10-200 bytes) are expected and indicate proper record alignment
+- Debug logs help verify partitions align with record boundaries
+- Each partition ends at a complete record, ensuring data integrity
+
 #### 3. Database Connection Failures
 
 **Symptoms**: Cannot create batch metadata tables
@@ -1063,7 +1127,7 @@ docker exec <kafka> kafka-console-consumer \
 
 **Solutions**:
 - Verify AWS credentials are valid
-- Check IAM permissions for S3 HeadObject
+- Check IAM permissions for S3 HeadObject and S3 GetObject (for range requests)
 - Ensure bucket exists and is accessible
 - Review S3 bucket policy
 
