@@ -1,0 +1,11 @@
+com\transaction\batch\master\service\FileProcessingService.class
+com\transaction\batch\master\listener\S3EventListener.class
+com\transaction\batch\master\MasterApplication.class
+com\transaction\batch\master\partitioner\ByteRangePartitioner.class
+com\transaction\batch\master\config\KafkaProducerConfig.class
+com\transaction\batch\master\config\BatchTransactionConfig.class
+com\transaction\batch\master\model\Transaction.class
+com\transaction\batch\master\config\AwsConfig.class
+com\transaction\batch\master\model\PartitionData.class
+com\transaction\batch\master\config\BatchConfig.class
+com\transaction\batch\master\config\DataSourceConfig.class
